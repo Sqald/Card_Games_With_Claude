@@ -1,0 +1,9 @@
+client/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+sample.env
+.git/
+*.zip
+README.md

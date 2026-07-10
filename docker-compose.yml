@@ -1,0 +1,36 @@
+# 統合ゲームサーバ (server/) + Cloudflare Tunnel を起動する。
+#
+# 使い方:
+#   cp sample.env .env      # 初回のみ。ポートや TUNNEL_TOKEN を編集する
+#   docker compose up -d --build
+#
+# ポート・サーバ名・トンネルのトークンは .env (sample.env 参照) から取得する。
+services:
+  game-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    env_file:
+      - .env
+    environment:
+      # コンテナ内では常に全インターフェースで待ち受ける
+      # (.env の SERVER_BIND はコンテナ外で直接起動する場合の設定)
+      SERVER_BIND: 0.0.0.0
+    ports:
+      # LAN内から直接つなぐ場合用。Tunnel経由のみなら削除してもよい
+      - "${SERVER_PORT:-80}:${SERVER_PORT:-80}"
+    restart: unless-stopped
+
+  # Cloudflare Tunnel: ポート開放なしで https://<公開ホスト名> から
+  # game-server へ到達できるようにする (大学等のFW越え用)。
+  # Cloudflare Zero Trust ダッシュボードのトンネル設定で、公開ホスト名の
+  # Service に http://game-server:${SERVER_PORT} (既定なら http://game-server:80)
+  # を指定すること。トンネルを使わない場合はこのサービスをコメントアウトする。
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      - game-server
+    restart: unless-stopped
