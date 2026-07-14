@@ -202,6 +202,11 @@ class RouletteEngine:
                     "status": p["status"],
                     "done": p["done"],
                     "bets": [bet_desc(b) for b in p["bets"]],
+                    # ベットテーブル描画用の構造化データ
+                    "bets_raw": [
+                        {"type": b["type"], "number": b["number"],
+                         "amount": b["amount"]} for b in p["bets"]
+                    ],
                     "total_bet": sum(b["amount"] for b in p["bets"]),
                     "result": p["result"],
                 } for pid, p in self.players.items()

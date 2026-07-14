@@ -7,6 +7,8 @@
 
 ヨーロピアン式 (0-36)。ベットはターン制ではなく全員同時受付で、
 全員が「賭け終了」を押すか、制限時間 (60秒) が経過するとスピンする。
+ベットは実際のカジノと同じレイアウトのテーブルにチップを置いて行う
+(チップ額を選んでセルをクリック)。
 """
 
 import copy
@@ -14,36 +16,223 @@ import math
 import sys
 
 from PySide6.QtCore import (
-    QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation,
+    QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QTextEdit, QVBoxLayout, QWidget,
 )
 
 # common を最初に import することで shared パッケージへのパスが通る
 from common import GameWindowBase, clear_layout, fade_in
 from shared.engines.roulette import (
-    BETTING_TIME, COLOR_CSS, RouletteEngine, START_CHIPS, WHEEL_ORDER,
-    color_of,
+    BETTING_TIME, COLOR_CSS, RouletteEngine, WHEEL_ORDER, color_of,
 )
 
-# コンボボックス表示順
-BET_TYPES = [
-    ("straight", "ストレート (数字1点 / 配当35倍)"),
-    ("red", "赤 (配当1倍)"),
-    ("black", "黒 (配当1倍)"),
-    ("odd", "奇数 (配当1倍)"),
-    ("even", "偶数 (配当1倍)"),
-    ("low", "ロー 1-18 (配当1倍)"),
-    ("high", "ハイ 19-36 (配当1倍)"),
-    ("dozen1", "ダース 1-12 (配当2倍)"),
-    ("dozen2", "ダース 13-24 (配当2倍)"),
-    ("dozen3", "ダース 25-36 (配当2倍)"),
-]
+# チップの額面と色 (実カジノ風)
+CHIP_VALUES = [10, 50, 100, 500]
+CHIP_COLORS = {10: "#7f8c8d", 50: "#c0392b", 100: "#2980b9", 500: "#8e44ad"}
+
+
+def chip_button_style(value):
+    return (
+        f"QPushButton {{ background:{CHIP_COLORS[value]}; color:white;"
+        " border:3px dashed #e0e0e0; border-radius:23px;"
+        " font-size:13px; font-weight:bold; }"
+        "QPushButton:checked { border:3px solid #ffd54f; }"
+        "QPushButton:disabled { background:#555; color:#999;"
+        " border:3px dashed #777; }")
+
+
+# ---------------------------------------------------------------- ベットテーブル
+
+class BetTableWidget(QWidget):
+    """実際のカジノと同じルーレットのベッティングレイアウト。
+
+    0 / 数字36マス / ダース / アウトサイド (1-18, EVEN, RED, BLACK,
+    ODD, 19-36) をクリックしてベットする。自分のチップは金色、
+    他プレイヤーの合計は青灰色のチップとして各セルに表示する。
+    """
+
+    bet_clicked = Signal(str, int)   # (bet_type, number)
+
+    MARGIN = 6
+    CELL_W = 46
+    CELL_H = 40
+    ZERO_W = 40
+    OUT_H = 34
+    FELT = "#14432b"
+    CELL_BG = "#1b4d33"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.regions = []   # (QRectF, btype, number, ラベル, 背景色)
+        self._build_regions()
+        self.setFixedSize(
+            self.MARGIN * 2 + self.ZERO_W + self.CELL_W * 12,
+            self.MARGIN * 2 + self.CELL_H * 3 + self.OUT_H * 2)
+        self.setMouseTracking(True)
+        self.my_bets = {}      # (btype, number) -> 自分の合計額
+        self.other_bets = {}   # (btype, number) -> 他プレイヤーの合計額
+        self.winning = None
+        self.betting_enabled = False
+        self._hover = None
+
+    def _build_regions(self):
+        m, w, h = self.MARGIN, self.CELL_W, self.CELL_H
+        x0 = m + self.ZERO_W
+        # 0 (左端・3行ぶち抜き)
+        self.regions.append((QRectF(m, m, self.ZERO_W, h * 3),
+                             "straight", 0, "0", COLOR_CSS["green"]))
+        # 数字 1-36 (実際の配置: 上段が3の倍数)
+        for c in range(12):
+            for r in range(3):
+                num = 3 * (c + 1) - r
+                self.regions.append((
+                    QRectF(x0 + c * w, m + r * h, w, h),
+                    "straight", num, str(num), COLOR_CSS[color_of(num)]))
+        # ダース
+        y1 = m + h * 3
+        dozens = [("dozen1", "1st 12"), ("dozen2", "2nd 12"),
+                  ("dozen3", "3rd 12")]
+        for i, (bt, label) in enumerate(dozens):
+            self.regions.append((QRectF(x0 + i * 4 * w, y1, 4 * w, self.OUT_H),
+                                 bt, 0, label, self.CELL_BG))
+        # アウトサイド
+        y2 = y1 + self.OUT_H
+        outs = [("low", "1-18", self.CELL_BG), ("even", "EVEN", self.CELL_BG),
+                ("red", "RED", COLOR_CSS["red"]),
+                ("black", "BLACK", COLOR_CSS["black"]),
+                ("odd", "ODD", self.CELL_BG), ("high", "19-36", self.CELL_BG)]
+        for i, (bt, label, bg) in enumerate(outs):
+            self.regions.append((QRectF(x0 + i * 2 * w, y2, 2 * w, self.OUT_H),
+                                 bt, 0, label, bg))
+
+    # ---- 状態操作
+
+    def set_bets(self, mine, others):
+        self.my_bets = dict(mine)
+        self.other_bets = dict(others)
+        self.update()
+
+    def set_winning(self, number):
+        if self.winning != number:
+            self.winning = number
+            self.update()
+
+    def set_betting_enabled(self, on):
+        if self.betting_enabled != on:
+            self.betting_enabled = on
+            if not on:
+                self._hover = None
+            self.setCursor(Qt.CursorShape.PointingHandCursor if on
+                           else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    # ---- マウス操作
+
+    def _region_at(self, pos):
+        for i, (rect, *_rest) in enumerate(self.regions):
+            if rect.contains(pos):
+                return i
+        return None
+
+    def mouseMoveEvent(self, event):
+        if not self.betting_enabled:
+            return
+        i = self._region_at(event.position())
+        if i != self._hover:
+            self._hover = i
+            self.update()
+
+    def leaveEvent(self, _event):
+        if self._hover is not None:
+            self._hover = None
+            self.update()
+
+    def mousePressEvent(self, event):
+        if (not self.betting_enabled
+                or event.button() != Qt.MouseButton.LeftButton):
+            return
+        i = self._region_at(event.position())
+        if i is not None:
+            _, btype, number, _, _ = self.regions[i]
+            self.bet_clicked.emit(btype, number)
+
+    # ---- 描画
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(self.FELT))
+        p.setPen(QPen(QColor("#d9b64c"), 2))
+        p.drawRoundedRect(
+            QRectF(1, 1, self.width() - 2, self.height() - 2), 8, 8)
+
+        font = QFont()
+        font.setBold(True)
+        for i, (rect, btype, number, label, bg) in enumerate(self.regions):
+            color = QColor(bg)
+            if not self.betting_enabled:
+                color = color.darker(115)
+            if i == self._hover:
+                color = color.lighter(135)
+            p.setBrush(color)
+            p.setPen(QPen(QColor(255, 255, 255, 130), 1))
+            p.drawRect(rect)
+            if (self.winning is not None and btype == "straight"
+                    and number == self.winning):
+                # 当選番号を金枠で強調
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor("#ffd54f"), 3))
+                p.drawRect(rect.adjusted(1.5, 1.5, -1.5, -1.5))
+            font.setPointSize(11 if btype == "straight" else 10)
+            p.setFont(font)
+            p.setPen(QColor("white"))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        # チップ (他プレイヤー → 自分の順で描き、自分のを手前にする)
+        for key, amount in self.other_bets.items():
+            self._draw_chip(p, key, amount, mine=False)
+        for key, amount in self.my_bets.items():
+            self._draw_chip(p, key, amount, mine=True)
+
+    def _rect_for(self, key):
+        btype, number = key
+        for rect, bt, num, _, _ in self.regions:
+            if bt == btype and (bt != "straight" or num == number):
+                return rect
+        return None
+
+    def _draw_chip(self, p, key, amount, mine):
+        rect = self._rect_for(key)
+        if rect is None:
+            return
+        if mine:
+            center = QPointF(rect.center().x(), rect.center().y() + 4)
+            radius = 13.0
+            p.setBrush(QColor("#ffd54f"))
+            p.setPen(QPen(QColor("#8a6d1a"), 1.5))
+            fg = "#4a3a08"
+        else:
+            center = QPointF(rect.left() + 12, rect.top() + 11)
+            radius = 10.0
+            p.setBrush(QColor("#607d8b"))
+            p.setPen(QPen(QColor("#37474f"), 1.5))
+            fg = "white"
+        p.drawEllipse(center, radius, radius)
+        font = QFont()
+        font.setBold(True)
+        text = str(amount)
+        font.setPointSize(8 if len(text) <= 3 else 7)
+        p.setFont(font)
+        p.setPen(QColor(fg))
+        p.drawText(QRectF(center.x() - radius, center.y() - radius,
+                          radius * 2, radius * 2),
+                   Qt.AlignmentFlag.AlignCenter, text)
 
 
 # ---------------------------------------------------------------- ホイール描画
@@ -211,7 +400,7 @@ class RouletteWindow(GameWindowBase):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("マルチプレイ・カジノルーレット")
-        self.resize(980, 760)
+        self.resize(1000, 820)
         self.statusBar().showMessage("メニューの「ゲーム > 接続設定」から開始してください")
         # ホスト用: 残り時間の配信と締切処理 (1秒間隔)
         self._tick_timer = QTimer(self)
@@ -229,16 +418,47 @@ class RouletteWindow(GameWindowBase):
         central.setStyleSheet("QWidget#table { background:#243b55; }")
         root = QVBoxLayout(central)
 
-        # ホイール (当選番号・残り時間・履歴)
+        # ホイール + ベットテーブル (当選番号・残り時間・履歴)
         board_box = QGroupBox("ルーレット")
         board_box.setStyleSheet("QGroupBox { color:white; font-weight:bold; }")
         bv = QVBoxLayout(board_box)
+        top_row = QHBoxLayout()
+        top_row.addStretch()
         self.wheel = WheelWidget()
-        wl_row = QHBoxLayout()
-        wl_row.addStretch()
-        wl_row.addWidget(self.wheel)
-        wl_row.addStretch()
-        bv.addLayout(wl_row)
+        top_row.addWidget(self.wheel)
+        top_row.addSpacing(14)
+
+        table_col = QVBoxLayout()
+        self.bet_table = BetTableWidget()
+        self.bet_table.bet_clicked.connect(self._on_table_bet)
+        table_col.addWidget(self.bet_table)
+        # チップ選択 (額面を選んでテーブルをクリック)
+        chip_row = QHBoxLayout()
+        chip_label = QLabel("チップ:")
+        chip_label.setStyleSheet("color:white; font-weight:bold;")
+        chip_row.addWidget(chip_label)
+        self.chip_value = 50
+        self.chip_buttons = []
+        for v in CHIP_VALUES:
+            b = QPushButton(str(v))
+            b.setCheckable(True)
+            b.setFixedSize(46, 46)
+            b.setEnabled(False)
+            b.setStyleSheet(chip_button_style(v))
+            b.clicked.connect(lambda _, v=v: self._select_chip(v))
+            chip_row.addWidget(b)
+            self.chip_buttons.append(b)
+        self.chip_buttons[CHIP_VALUES.index(self.chip_value)].setChecked(True)
+        hint = QLabel("額面を選んでテーブルをクリック")
+        hint.setStyleSheet("color:#b9c9de; font-size:12px;")
+        chip_row.addSpacing(10)
+        chip_row.addWidget(hint)
+        chip_row.addStretch()
+        table_col.addLayout(chip_row)
+        top_row.addLayout(table_col)
+        top_row.addStretch()
+        bv.addLayout(top_row)
+
         self.timer_label = QLabel("")
         self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.timer_label.setStyleSheet(
@@ -271,43 +491,15 @@ class RouletteWindow(GameWindowBase):
         scroll.setMinimumHeight(220)
         root.addWidget(scroll, 1)
 
-        # ベット操作
-        bet_row = QHBoxLayout()
-        bet_row.addStretch()
-        self.type_combo = QComboBox()
-        for _, label in BET_TYPES:
-            self.type_combo.addItem(label)
-        self.type_combo.setMinimumHeight(36)
-        self.type_combo.currentIndexChanged.connect(
-            lambda i: self.num_spin.setEnabled(i == 0))
-        bet_row.addWidget(self.type_combo)
-        bet_row.addWidget(QLabel("数字:"))
-        self.num_spin = QSpinBox()
-        self.num_spin.setRange(0, 36)
-        self.num_spin.setMinimumHeight(36)
-        bet_row.addWidget(self.num_spin)
-        bet_row.addWidget(QLabel("賭け額:"))
-        self.amt_spin = QSpinBox()
-        self.amt_spin.setRange(1, START_CHIPS)
-        self.amt_spin.setValue(50)
-        self.amt_spin.setSingleStep(10)
-        self.amt_spin.setMinimumHeight(36)
-        bet_row.addWidget(self.amt_spin)
-        self.bet_btn = QPushButton("ベット追加")
-        bet_row.addWidget(self.bet_btn)
-        bet_row.addStretch()
-        root.addLayout(bet_row)
-
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self.clear_btn = QPushButton("ベット取消")
         self.done_btn = QPushButton("賭け終了")
         self.start_btn = QPushButton("ラウンド開始")
-        for b in (self.bet_btn, self.clear_btn, self.done_btn, self.start_btn):
+        for b in (self.clear_btn, self.done_btn, self.start_btn):
             b.setMinimumHeight(40)
             b.setStyleSheet("font-size:15px; font-weight:bold;")
             b.setEnabled(False)
-        self.bet_btn.clicked.connect(self.send_bet)
         self.clear_btn.clicked.connect(
             lambda: self.submit_action({"type": "action", "action": "clear"}))
         self.done_btn.clicked.connect(
@@ -345,7 +537,12 @@ class RouletteWindow(GameWindowBase):
         self.wheel.stop_spin()
         self.wheel.set_idle(False)
         self.wheel.set_center("-", "#555")
-        for b in (self.bet_btn, self.clear_btn, self.done_btn, self.start_btn):
+        self.bet_table.set_bets({}, {})
+        self.bet_table.set_winning(None)
+        self.bet_table.set_betting_enabled(False)
+        for b in (self.clear_btn, self.done_btn, self.start_btn):
+            b.setEnabled(False)
+        for b in self.chip_buttons:
             b.setEnabled(False)
         clear_layout(self.players_row)
         clear_layout(self.history_row)
@@ -378,11 +575,22 @@ class RouletteWindow(GameWindowBase):
 
     # ---------------- 操作
 
-    def send_bet(self):
-        btype = BET_TYPES[self.type_combo.currentIndex()][0]
+    def _select_chip(self, value):
+        self.chip_value = value
+        for b, v in zip(self.chip_buttons, CHIP_VALUES):
+            b.setChecked(v == value)
+
+    def _on_table_bet(self, btype, number):
+        """ベットテーブルのセルがクリックされた → 選択中のチップ額を置く。"""
+        me = (self.last_state or {}).get("players", {}).get(str(self.my_id))
+        if (me and isinstance(me.get("chips"), int)
+                and me["chips"] < self.chip_value):
+            self.statusBar().showMessage(
+                f"チップが足りません (残り {me['chips']})")
+            return
         self.submit_action({
             "type": "action", "action": "bet", "bet_type": btype,
-            "number": self.num_spin.value(), "amount": self.amt_spin.value(),
+            "number": number, "amount": self.chip_value,
         })
 
     def host_start_round(self):
@@ -481,6 +689,19 @@ class RouletteWindow(GameWindowBase):
             if fade_results and i == len(state["history"]) - 1:
                 fade_in(lbl, 420)   # 直近の当選番号を演出
 
+        # ベットテーブル (全員のチップと当選番号)
+        mine, others = {}, {}
+        for pid_str, pl in state["players"].items():
+            for b in pl.get("bets_raw", []):
+                key = (b["type"],
+                       b["number"] if b["type"] == "straight" else 0)
+                target = (mine if (self.my_id is not None
+                                   and pid_str == str(self.my_id)) else others)
+                target[key] = target.get(key, 0) + b["amount"]
+        self.bet_table.set_bets(mine, others)
+        self.bet_table.set_winning(
+            state["winning"] if phase == "result" and not spinning else None)
+
         # プレイヤー
         clear_layout(self.players_row)
         for pid in state["order"]:
@@ -528,11 +749,11 @@ class RouletteWindow(GameWindowBase):
         me = state["players"].get(str(self.my_id))
         can_bet = (phase == "betting" and me is not None
                    and me["status"] == "betting" and not me["done"])
-        self.bet_btn.setEnabled(can_bet)
+        self.bet_table.set_betting_enabled(can_bet)
+        for b in self.chip_buttons:
+            b.setEnabled(can_bet)
         self.done_btn.setEnabled(can_bet)
         self.clear_btn.setEnabled(can_bet and bool(me["bets"]))
-        if can_bet and me["chips"] > 0:
-            self.amt_spin.setMaximum(me["chips"])
         # スピン演出中は次ラウンドを開始できない
         can = self.can_control(state)
         self.start_btn.setEnabled(can and phase != "betting" and not spinning)
@@ -544,7 +765,8 @@ class RouletteWindow(GameWindowBase):
             self.statusBar().showMessage("スピン中...")
         elif can_bet:
             self.statusBar().showMessage(
-                f"ベットを置いて「賭け終了」を押してください (残り {state['time_left']} 秒)")
+                f"チップを選んでテーブルをクリック → 「賭け終了」"
+                f" (残り {state['time_left']} 秒)")
         elif phase == "betting":
             waiting = [q["name"] for q in state["players"].values()
                        if q["status"] == "betting" and not q["done"]]
